@@ -92,4 +92,120 @@ async function saveToNotion(content: any, input: string): Promise<string> {
     { object: "block", type: "paragraph", paragraph: { rich_text: [{ type: "text", text: { content: content.caption } }] } }
   );
 
-  const res = await fet
+  const res = await fetch("https://api.notion.com/v1/pages", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${NOTION_API_KEY}`,
+      "Notion-Version": "2022-06-28",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      parent: { database_id: NOTION_DB_ID },
+      properties: {
+        Name: { title: [{ text: { content: content.notion_title } }] },
+        Status: { select: { name: "Draft" } },
+        Pijler: { select: { name: content.pillar } },
+        Format: { select: { name: content.format } },
+      },
+      children,
+    }),
+  });
+
+  if (!res.ok) throw new Error(`Notion error: ${res.status}`);
+  const page = await res.json();
+  return page.url;
+}
+
+// ─── Claude content generatie ─────────────────────────────────────────────────
+
+async function generateContent(input: string, recentPosts: any[]) {
+  const recentSummary = recentPosts.length > 0
+    ? recentPosts.map((p) => `- ${p.format} | ${p.pillar} | ${p.status}`).join("\n")
+    : "Geen recente posts.";
+
+  const msg = await anthropic.messages.create({
+    model: "claude-opus-4-5",
+    max_tokens: 2000,
+    messages: [{
+      role: "user",
+      content: `Je bent de content strategist van Joemen.
+
+Joemen merkidentiteit:
+- Tone: direct, oprecht, geen trucjes, strategie-gericht
+- Tagline: "Menselijke marketing als fundament voor groei"
+- Doelgroep: ondernemers die authentiek willen groeien
+- 4 content pijlers: PROOF (resultaten), VALUE (tips/kennis), CONNECTION (persoonlijk), ENGAGEMENT (interactie)
+
+Recente posts:
+${recentSummary}
+
+Input van Jelle:
+"${input}"
+
+Bepaal de beste pijler op basis van wat ontbreekt en maak de content.
+
+Return ENKEL een JSON object, niets anders:
+{
+  "pillar": "PROOF | VALUE | CONNECTION | ENGAGEMENT",
+  "format": "reel | carrousel | caption-only",
+  "reel_script": {
+    "hook": "...",
+    "body": ["stap 1", "stap 2", "stap 3"],
+    "cta": "..."
+  },
+  "caption": "volledige caption met hashtags",
+  "carousel_slides": ["slide 1", "slide 2"],
+  "notion_title": "korte titel max 60 tekens"
+}
+
+carousel_slides: alleen bij carrousel, anders [].
+reel_script: alleen bij reel, anders null.`,
+    }],
+  });
+
+  const raw = msg.content[0].type === "text" ? msg.content[0].text : "";
+  return JSON.parse(raw.replace(/```json|```/g, "").trim());
+}
+
+// ─── Bot handlers ─────────────────────────────────────────────────────────────
+
+bot.command("start", (ctx) => {
+  if (!ALLOWED_USERS.includes(ctx.from?.id || 0)) return;
+  ctx.reply("👋 *Joemen Content Agent actief.*\n\nStuur een idee en ik maak er een content draft van in Notion.\n\n*Pijlers:* PROOF · VALUE · CONNECTION · ENGAGEMENT", { parse_mode: "Markdown" });
+});
+
+bot.command("id", (ctx) => {
+  ctx.reply(`Jouw user ID: \`${ctx.from?.id}\``, { parse_mode: "Markdown" });
+});
+
+bot.on("message:text", async (ctx) => {
+  if (!ALLOWED_USERS.includes(ctx.from?.id || 0)) return;
+  if (ctx.message.text.startsWith("/")) return;
+
+  const statusMsg = await ctx.reply("✍️ Bezig...");
+
+  try {
+    const recentPosts = await getRecentPosts();
+    const content = await generateContent(ctx.message.text, recentPosts);
+    const notionUrl = await saveToNotion(content, ctx.message.text);
+
+    const pillarEmoji: Record<string, string> = { PROOF: "🏆", VALUE: "💡", CONNECTION: "❤️", ENGAGEMENT: "💬" };
+    const formatLabel: Record<string, string> = { reel: "🎬 Reel", carrousel: "🖼️ Carrousel", "caption-only": "✍️ Caption" };
+
+    await ctx.api.editMessageText(
+      ctx.chat.id,
+      statusMsg.message_id,
+      `✅ *Draft aangemaakt*\n\n${pillarEmoji[content.pillar] || "📌"} *Pijler:* ${content.pillar}\n${formatLabel[content.format] || content.format}\n📌 *Titel:* ${content.notion_title}\n\n🔗 [Open in Notion](${notionUrl})`,
+      { parse_mode: "Markdown" }
+    );
+  } catch (err: any) {
+    await ctx.api.editMessageText(ctx.chat.id, statusMsg.message_id, `❌ Fout: ${err.message}`);
+  }
+});
+
+// ─── Start ────────────────────────────────────────────────────────────────────
+
+console.log("Joemen Content Agent starting...");
+const botInfo = await bot.api.getMe();
+console.log(`Bot started: @${botInfo.username}`);
+bot.start();
